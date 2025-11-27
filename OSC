@@ -1,0 +1,16 @@
+{
+  "input_names": ["tick"],
+  "neurons": [
+    {
+      "name": "OSC1",
+      "neuron_type": "integrate_and_fire",
+      "inputs": [
+        ["OSC1", -2.0, "S"]
+      ],
+      "bias": 0.5,
+      "threshold": 1.0,
+      "leak_rate": 0.05,
+      "state": 0.0
+    }
+  ]
+}
