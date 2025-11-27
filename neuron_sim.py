@@ -1,12 +1,13 @@
 # patched_freeform_nn.py
 import json
 import csv
+import time
 import numpy as np
 import pandas as pd
 from collections import deque, defaultdict
 
 class Neuron:
-    def __init__(self, name, neuron_type="leaky_integrate_and_fire"):
+    def __init__(self, name, neuron_type="izhikevich"):
         self.name = name
         self.inputs = []  # (source_name, weight, synapse_type)
         self.bias = 0.0
@@ -14,8 +15,18 @@ class Neuron:
         self.state = 0.0
         self.output_cache = None
 
+        # Legacy parameters (for backward compatibility)
         self.threshold = 1.0
         self.leak_rate = 0.1
+
+        # Izhikevich model parameters (Regular Spiking by default)
+        self.v = -65.0  # Membrane potential (mV)
+        self.u = -13.0  # Recovery variable
+        self.a = 0.02   # Recovery time scale
+        self.b = 0.2    # Sensitivity of u to v
+        self.c = -65.0  # After-spike reset value of v
+        self.d = 8.0    # After-spike reset increment of u
+        self.v_threshold = 30.0  # Spike threshold (mV)
 
         # --- new fields for advanced dynamics ---
         self.recent_spikes = deque(maxlen=16)  # timestamps (step indices)
@@ -39,6 +50,14 @@ class Neuron:
             "threshold": self.threshold,
             "leak_rate": self.leak_rate,
             "state": self.state,
+            # Izhikevich parameters
+            "v": self.v,
+            "u": self.u,
+            "a": self.a,
+            "b": self.b,
+            "c": self.c,
+            "d": self.d,
+            "v_threshold": self.v_threshold,
             # store some new params for reproducibility
             "burst_length": self.burst_length,
             "stp_recovery": self.stp_recovery,
@@ -49,37 +68,53 @@ class Neuron:
 
     @staticmethod
     def from_dict(d):
-        n = Neuron(d["name"], d.get("neuron_type", "leaky_integrate_and_fire"))
+        n = Neuron(d["name"], d.get("neuron_type", "izhikevich"))
         n.inputs = d.get("inputs", [])
         n.bias = d.get("bias", 0.0)
-        
+
         # --- Essential Parameters ---
         # Get threshold and leak_rate from the dict, falling back to the class defaults (which are 1.0 and 0.1)
         # However, because Neuron() is called above, we must rely on the dict values or Python's behavior will prioritize the initial __init__ values.
         n.threshold = d.get("threshold", n.threshold)
         n.leak_rate = d.get("leak_rate", n.leak_rate)
         n.state = d.get("state", 0.0)
-        
+
+        # --- Izhikevich Parameters ---
+        if "v" in d:
+            n.v = d["v"]
+        if "u" in d:
+            n.u = d["u"]
+        if "a" in d:
+            n.a = d["a"]
+        if "b" in d:
+            n.b = d["b"]
+        if "c" in d:
+            n.c = d["c"]
+        if "d" in d:
+            n.d = d["d"]
+        if "v_threshold" in d:
+            n.v_threshold = d["v_threshold"]
+
         # --- Advanced Parameters (The Source of the Problem) ---
         # The previous code used getattr(n, "param", default) which unnecessarily complicated fetching the default.
         # We simply need to ensure the value from the dict is used, or the initial __init__ value is kept.
-        
+
         # NOTE: We rely on the initial Neuron.__init__ setting the safe defaults (e.g., burst_length=3).
         # We only override them if they are explicitly present in the loaded dictionary `d`.
 
         # CORRECTED LOADING: Use the value from the dictionary 'd' if present, otherwise keep the value set in __init__
         if "burst_length" in d:
             n.burst_length = d["burst_length"]
-        
+
         if "stp_recovery" in d:
             n.stp_recovery = d["stp_recovery"]
-        
+
         if "stp_depression" in d:
             n.stp_depression = d["stp_depression"]
-        
+
         if "coincidence_require" in d:
             n.coincidence_require = d["coincidence_require"]
-        
+
         if "coincidence_window" in d:
             n.coincidence_window = d["coincidence_window"]
 
@@ -103,8 +138,52 @@ class Neuron:
     def clear_cache(self):
         self.output_cache = None
 
+    def get_spike_proximity(self):
+        """Returns a value 0-1 indicating how close the neuron is to spiking.
+        1.0 means very close (near threshold), 0.0 means far from spiking."""
+        if self.neuron_type == "izhikevich":
+            # Map voltage range to 0-1
+            # Typical range: v_rest (-65) to v_threshold (30)
+            v_rest = -65.0
+            v_range = self.v_threshold - v_rest  # 95 mV
+            normalized = (self.v - v_rest) / v_range
+            return max(0.0, min(1.0, normalized))
+        elif self.neuron_type in ["leaky_integrate_and_fire", "integrate_and_fire"]:
+            normalized = self.state / self.threshold
+            return max(0.0, min(1.0, normalized))
+        else:
+            return 0.0
+
     def activate(self, x, step_index=None):
-        if self.neuron_type == "integrate_and_fire":
+        if self.neuron_type == "izhikevich":
+            # Izhikevich neuron model
+            # Input current (scaled to mV range)
+            I = (x + self.bias) * 10.0  # Scale input to appropriate range
+
+            # Integration timestep (ms)
+            dt = 0.5
+
+            # Euler integration with sub-steps for stability
+            for _ in range(2):
+                # dv/dt = 0.04v² + 5v + 140 - u + I
+                dv = (0.04 * self.v * self.v + 5 * self.v + 140 - self.u + I) * dt
+                # du/dt = a(bv - u)
+                du = self.a * (self.b * self.v - self.u) * dt
+
+                self.v += dv
+                self.u += du
+
+            # Check for spike
+            if self.v >= self.v_threshold:
+                self.v = self.c  # Reset voltage
+                self.u += self.d  # Reset recovery variable
+                if step_index is not None:
+                    self.recent_spikes.append(step_index)
+                return 1.0
+            else:
+                return 0.0
+
+        elif self.neuron_type == "integrate_and_fire":
             self.state += x + self.bias
             if self.state >= self.threshold:
                 self.state = 0.0
@@ -123,10 +202,18 @@ class Neuron:
             else:
                 return 0.0
         else:
-            # Default to leaky integrate and fire if unknown type
-            self.state = (1 - self.leak_rate) * self.state + x + self.bias
-            if self.state >= self.threshold:
-                self.state = -0.5 * self.threshold
+            # Default to Izhikevich model if unknown type
+            I = (x + self.bias) * 10.0
+            dt = 0.5
+            for _ in range(2):
+                dv = (0.04 * self.v * self.v + 5 * self.v + 140 - self.u + I) * dt
+                du = self.a * (self.b * self.v - self.u) * dt
+                self.v += dv
+                self.u += du
+
+            if self.v >= self.v_threshold:
+                self.v = self.c
+                self.u += self.d
                 if step_index is not None:
                     self.recent_spikes.append(step_index)
                 return 1.0
@@ -340,7 +427,7 @@ def load_csv_network(filename, input_ids=None):
 
             for n in [pre, post]:
                 if n not in neuron_ids and n not in input_ids:
-                    nn.add_neuron(n, "leaky_integrate_and_fire")
+                    nn.add_neuron(n, "izhikevich")
                     neuron_ids.add(n)
 
             nn.add_connection(post, pre, weight=weight, synapse_type=syn_type)
@@ -376,11 +463,11 @@ def generate_random_LIF_network(n_inputs=5, n_neurons=50, n_outputs=5, connectio
     
     # Add hidden neurons
     for i in range(n_neurons):
-        nn.add_neuron(f"h{i}", neuron_type="leaky_integrate_and_fire")
-    
+        nn.add_neuron(f"h{i}", neuron_type="izhikevich")
+
     # Add output neurons
     for i in range(n_outputs):
-        nn.add_neuron(f"out{i}", neuron_type="leaky_integrate_and_fire")
+        nn.add_neuron(f"out{i}", neuron_type="izhikevich")
     
     all_neurons = list(nn.neurons.keys())
     
@@ -428,7 +515,7 @@ def load_xls_network(filename, input_names=None):
         # Create neurons if not present
         for n in (pre, post):
             if n not in neuron_ids and n not in input_names:
-                nn.add_neuron(n, "leaky_integrate_and_fire")
+                nn.add_neuron(n, "izhikevich")
                 neuron_ids.add(n)
 
         nn.add_connection(post, pre, weight=count, synapse_type=syn_type)
@@ -443,15 +530,32 @@ def load_xls_network(filename, input_names=None):
     return nn
 
 
+def calculate_adaptive_delay(nn, base_delay=0.1, min_delay=0.01, max_delay=0.5):
+    """Calculate delay based on maximum spike proximity across all neurons.
+    When neurons are close to spiking, delay is shorter (faster updates).
+    When far from spiking, delay is longer (slower updates)."""
+    if nn is None or not nn.neurons:
+        return base_delay
+
+    max_proximity = 0.0
+    for neuron in nn.neurons.values():
+        proximity = neuron.get_spike_proximity()
+        max_proximity = max(max_proximity, proximity)
+
+    # Inverse relationship: high proximity -> low delay (fast updates)
+    # Use exponential scaling for more dramatic effect near spikes
+    delay = max_delay - (max_delay - min_delay) * (max_proximity ** 2)
+    return delay
+
 def main():
     print("Free-form Neural Network Shell")
-    print("Supported neuron types: integrate_and_fire, leaky_integrate_and_fire")
+    print("Supported neuron types: izhikevich, integrate_and_fire, leaky_integrate_and_fire")
     nn = None
 
     while True:
         cmd = input("\nCommands:\n"
                     " create [inputs...]\n"
-                    " add_neuron [name] [type: integrate_and_fire|leaky_integrate_and_fire]\n"
+                    " add_neuron [name] [type: izhikevich|integrate_and_fire|leaky_integrate_and_fire]\n"
                     " set_bias [neuron] [bias]\n"
                     " add_conn [target] [source] [weight (opt)] [type (S, Sp, R, Rp, EJ, NMJ)]\n"
                     " run_step [steps] [min] [max]\n"
@@ -479,7 +583,7 @@ def main():
             elif action == "add_neuron":
                 if nn is None: print("Create network first"); continue
                 name = parts[1]
-                ntype = parts[2] if len(parts) > 2 else "leaky_integrate_and_fire"
+                ntype = parts[2] if len(parts) > 2 else "izhikevich"
                 nn.add_neuron(name, ntype)
                 print(f"Added neuron '{name}' of type '{ntype}'")
             elif action == "set_bias":
@@ -502,28 +606,54 @@ def main():
                 inputs = [0.0 for _ in nn.input_names]
                 history = []
 
+                print("Adaptive timing enabled: updates faster near spikes")
+                print("-" * 80)
+
                 for t in range(steps):
                     # Random walk input
                     for i in range(len(inputs)):
                         change = np.random.uniform(-0.1, 0.1)
                         inputs[i] = max(vmin, min(vmax, inputs[i] + change))
-            
+
                     output = nn.forward(inputs)
                     history.append((list(inputs), dict(output)))
+
+                    # Calculate adaptive delay
+                    delay = calculate_adaptive_delay(nn)
+                    max_prox = max([n.get_spike_proximity() for n in nn.neurons.values()] or [0.0])
+
                     print(f"Step {t:03d} | Input: {['%.2f' % x for x in inputs]} | Output: " +
-                          ', '.join(f"{k}:{v:.2f}" for k, v in output.items()))
+                          ', '.join(f"{k}:{v:.2f}" for k, v in output.items()) +
+                          f" | Proximity: {max_prox:.2f} | Delay: {delay:.3f}s")
+
+                    time.sleep(delay)
+
+                print("-" * 80)
 
             elif action == "run_pulse":
                 if nn is None: print("Create network first"); continue
                 steps = int(parts[1]) if len(parts) > 1 else 20
                 history = []
-            
+
+                print("Adaptive timing enabled: updates faster near spikes")
+                print("-" * 80)
+
                 for t in range(steps):
                     inputs = [np.random.choice([0.0, 1.0]) for _ in nn.input_names]
                     output = nn.forward(inputs)
                     history.append((list(inputs), dict(output)))
+
+                    # Calculate adaptive delay
+                    delay = calculate_adaptive_delay(nn)
+                    max_prox = max([n.get_spike_proximity() for n in nn.neurons.values()] or [0.0])
+
                     print(f"Step {t:03d} | Input: {inputs} | Output: " +
-                          ', '.join(f"{k}:{v:.2f}" for k, v in output.items()))
+                          ', '.join(f"{k}:{v:.2f}" for k, v in output.items()) +
+                          f" | Proximity: {max_prox:.2f} | Delay: {delay:.3f}s")
+
+                    time.sleep(delay)
+
+                print("-" * 80)
             
             elif action == "train":
                 if nn is None: print("Create network first"); continue
@@ -593,22 +723,43 @@ def main():
                 inputs = [0.0 for _ in nn.input_names]
                 
                 print(f"\nPulsing input '{input_name}' with {voltage}V for {steps_on} steps ON, {steps_off} steps OFF")
+                print("Adaptive timing enabled: updates faster near spikes")
                 print("-" * 80)
-                
+
                 # Simulate with voltage ON
                 for step in range(steps_on):
                     inputs[input_idx] = voltage
                     output = nn.forward(inputs)
+
+                    # Calculate adaptive delay
+                    delay = calculate_adaptive_delay(nn)
+
+                    # Show spike proximity for monitoring
+                    max_prox = max([n.get_spike_proximity() for n in nn.neurons.values()] or [0.0])
+
                     print(f"Step {step:03d} (ON)  | Input: {['%.2f' % x for x in inputs]} | Output: " +
-                          ', '.join(f"{k}:{v:.2f}" for k, v in output.items()))
-                
+                          ', '.join(f"{k}:{v:.2f}" for k, v in output.items()) +
+                          f" | Proximity: {max_prox:.2f} | Delay: {delay:.3f}s")
+
+                    time.sleep(delay)
+
                 # Simulate with voltage OFF
                 for step in range(steps_off):
                     inputs[input_idx] = 0.0
                     output = nn.forward(inputs)
+
+                    # Calculate adaptive delay
+                    delay = calculate_adaptive_delay(nn)
+
+                    # Show spike proximity for monitoring
+                    max_prox = max([n.get_spike_proximity() for n in nn.neurons.values()] or [0.0])
+
                     print(f"Step {step:03d} (OFF) | Input: {['%.2f' % x for x in inputs]} | Output: " +
-                          ', '.join(f"{k}:{v:.2f}" for k, v in output.items()))
-                
+                          ', '.join(f"{k}:{v:.2f}" for k, v in output.items()) +
+                          f" | Proximity: {max_prox:.2f} | Delay: {delay:.3f}s")
+
+                    time.sleep(delay)
+
                 print("-" * 80)
                 print(f"Pulse sequence complete.\n")
             elif action == "generate":
@@ -625,11 +776,11 @@ def main():
             
                     # Add hidden neurons
                     for hn in hidden_names:
-                        nn.add_neuron(hn, "leaky_integrate_and_fire")
-            
+                        nn.add_neuron(hn, "izhikevich")
+
                     # Add output neurons
                     for on in output_names:
-                        nn.add_neuron(on, "leaky_integrate_and_fire")
+                        nn.add_neuron(on, "izhikevich")
             
                     # Connect inputs to hidden
                     for hn in hidden_names:
