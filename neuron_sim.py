@@ -3,13 +3,10 @@ import json
 import csv
 import numpy as np
 import pandas as pd
-import networkx as nx
-import matplotlib.pyplot as plt
-import matplotlib
 from collections import deque, defaultdict
 
 class Neuron:
-    def __init__(self, name, neuron_type="sigmoid"):
+    def __init__(self, name, neuron_type="leaky_integrate_and_fire"):
         self.name = name
         self.inputs = []  # (source_name, weight, synapse_type)
         self.bias = 0.0
@@ -52,7 +49,7 @@ class Neuron:
 
     @staticmethod
     def from_dict(d):
-        n = Neuron(d["name"], d.get("neuron_type", "sigmoid"))
+        n = Neuron(d["name"], d.get("neuron_type", "leaky_integrate_and_fire"))
         n.inputs = d.get("inputs", [])
         n.bias = d.get("bias", 0.0)
         
@@ -107,12 +104,7 @@ class Neuron:
         self.output_cache = None
 
     def activate(self, x, step_index=None):
-        # note: step_index is used to timestamp spikes for coincidence detectors
-        if self.neuron_type == "sigmoid":
-            return 1 / (1 + np.exp(-x))
-        elif self.neuron_type == "relu":
-            return max(0.0, x)
-        elif self.neuron_type == "integrate_and_fire":
+        if self.neuron_type == "integrate_and_fire":
             self.state += x + self.bias
             if self.state >= self.threshold:
                 self.state = 0.0
@@ -127,55 +119,19 @@ class Neuron:
                 self.state = -0.5 * self.threshold
                 if step_index is not None:
                     self.recent_spikes.append(step_index)
-                
                 return 1.0
             else:
                 return 0.0
-        elif self.neuron_type == "slow_integrator":
-            # accumulate slowly
-            self.state = (1 - 1e-2 * self.leak_rate) * self.state + 0.01 * (x + self.bias)
-            # output is graded
-            return 1 / (1 + np.exp(-self.state))
-        elif self.neuron_type == "bistable":
-            # if excited beyond threshold -> latch on
-            if x + self.bias >= self.threshold:
-                self.state = 1.0
-                if step_index is not None:
-                    self.recent_spikes.append(step_index)
-                return 1.0
-            # if inhibited strongly -> turn off (use negative x)
-            if x + self.bias <= -self.threshold:
-                self.state = 0.0
-                return 0.0
-            return self.state
-        elif self.neuron_type == "coincidence":
-            # x is ignored; we check recent_spikes from inputs instead in compute_output
-            # fallback: soft activation
-            return 1.0 if len(self.recent_spikes) > 0 else 0.0
-        elif self.neuron_type == "burst":
-            # if currently bursting, emit 1 and decrement
-            if self.burst_remaining > 0:
-                self.burst_remaining -= 1
-                if step_index is not None:
-                    self.recent_spikes.append(step_index)
-                return 1.0
-            else:
-                # not bursting; if input triggers, start a burst but also produce first pulse now
-                if x + self.bias >= self.threshold:
-                    self.burst_remaining = self.burst_length - 1
-                    if step_index is not None:
-                        self.recent_spikes.append(step_index)
-                    return 1.0
-                return 0.0
-        elif self.neuron_type == "modulator":
-            # modulators are graded too (sigmoid)
-            out = 1 / (1 + np.exp(-(x + self.bias)))
-            # consider as spike when large
-            if out > 0.5 and step_index is not None:
-                self.recent_spikes.append(step_index)
-            return out
         else:
-            return 1 / (1 + np.exp(-x))
+            # Default to leaky integrate and fire if unknown type
+            self.state = (1 - self.leak_rate) * self.state + x + self.bias
+            if self.state >= self.threshold:
+                self.state = -0.5 * self.threshold
+                if step_index is not None:
+                    self.recent_spikes.append(step_index)
+                return 1.0
+            else:
+                return 0.0
 
     def compute_output(self, values, step_index=0):
         # caching per-step handled externally by clear_all_cache
@@ -198,25 +154,6 @@ class Neuron:
 
             total_input += src_val * eff_w
 
-        # Special handling for 'coincidence' neuron: check how many distinct presynaptic spikes in window
-        if self.neuron_type == "coincidence":
-            # 'values' must include timestamped spike flags: we track recent spikes by reading source recent_spikes if passed (we require the network to call compute_output in order)
-            # Here we approximate by summing boolean values over inputs within window: if input values are 1.0 at this step, count distinct sources
-            count = 0
-            for src, _, _ in self.inputs:
-                if values.get(src, 0.0) > 0:
-                    count += 1
-            fire = 1.0 if count >= self.coincidence_require else 0.0
-            if fire and step_index is not None:
-                self.recent_spikes.append(step_index)
-            self.output_cache = fire
-            # On firing, apply STP depression to those synapses
-            for src, _, syn_type in self.inputs:
-                if syn_type == "STP":
-                    self.stp_state[src] = max(0.0, self.stp_state.get(src, 1.0) - self.stp_depression)
-            return self.output_cache
-
-        # For modulators we want graded output, then FreeFormNN will apply modulation side-effects
         output = self.activate(total_input, step_index=step_index)
 
         # If any STP synapses have a presynaptic spike this step, depress them
@@ -279,12 +216,6 @@ class FreeFormNN:
             # add reciprocal weak connection automatically
             self.neurons[source_name].add_input(neuron_name, weight, reverse_input_count, "EJ")
 
-    def add_modulation_target(self, mod_name, target_name, param, scale):
-        """Register target (target_name) parameter (param as string) to be modulated by 'mod_name' scaled by 'scale'."""
-        if mod_name not in self.neurons:
-            raise ValueError("modulator neuron not found")
-        self.neurons[mod_name].mod_targets.append((target_name, param, float(scale)))
-
     def clear_all_cache(self):
         for neuron in self.neurons.values():
             neuron.clear_cache()
@@ -294,50 +225,21 @@ class FreeFormNN:
             raise ValueError("Input length mismatch.")
         values = dict(zip(self.input_names, input_values))
         history = []
-    
+
         for _ in range(steps):
             self.clear_all_cache()
             current_outputs = {}
-    
-            # --- PHASE 1: SEQUENTIAL UPDATE FOR SPIKE PROPAGATION ---
+
             # Compute neuron outputs in insertion order, immediately updating 'values'
             for neuron in self.neurons.values():
                 out = neuron.compute_output(values, step_index=self.step_index)
                 current_outputs[neuron.name] = out
                 # Make output immediately available for downstream neurons
                 values[neuron.name] = out
-    
-            # --- PHASE 2: APPLY MODULATORS AFTER ALL OUTPUTS ---
-            pending_param_updates = {}
-            for n in self.neurons.values():
-                if n.neuron_type == "modulator":
-                    level = current_outputs.get(n.name, 0.0)
-                    for target_name, param, scale in n.mod_targets:
-                        if target_name not in self.neurons:
-                            continue
-                        if target_name not in pending_param_updates:
-                            pending_param_updates[target_name] = {}
-                        if param == "weight":
-                            pending_param_updates[target_name]["weight_factor"] = 1.0 + level * scale
-                        elif param == "leak_rate":
-                            pending_param_updates[target_name]["new_leak_rate"] = self.neurons[target_name].leak_rate * (1.0 + level * scale)
-                        elif param == "threshold":
-                            pending_param_updates[target_name]["new_threshold"] = self.neurons[target_name].threshold * (1.0 + (1.0 - level) * scale)
-    
-            # Apply collected modulator updates
-            for target_name, updates in pending_param_updates.items():
-                target = self.neurons[target_name]
-                if "weight_factor" in updates:
-                    factor = updates["weight_factor"]
-                    target.inputs = [(src, w*factor, syn_type) for src, w, syn_type in target.inputs]
-                if "new_leak_rate" in updates:
-                    target.leak_rate = updates["new_leak_rate"]
-                if "new_threshold" in updates:
-                    target.threshold = updates["new_threshold"]
-    
+
             history.append(dict(values))
             self.step_index += 1
-    
+
         return history[-1] if history else {}
 
 
@@ -368,46 +270,37 @@ class FreeFormNN:
         return net
 
     def visualize(self, activations=None):
-        G = nx.DiGraph()
-        labels = {}
-        node_colors = []
+        """Display network connections in terminal format."""
+        print("\n" + "="*80)
+        print("NEURAL NETWORK STRUCTURE")
+        print("="*80)
 
-        # Ensure we get a complete list of nodes (including from inputs)
-        all_node_names = set(self.neurons.keys()).union(self.input_names)
+        # Display input neurons
+        print("\nINPUT NEURONS:")
+        for inp in self.input_names:
+            print(f"  {inp}")
+
+        # Display all neurons and their connections
+        print("\nNEURONS AND CONNECTIONS:")
         for neuron in self.neurons.values():
-            for src, _, _ in neuron.inputs:
-                all_node_names.add(src)
+            bias = neuron.bias
+            neuron_display = f"{neuron.name} (bias: {bias:.2f})"
+            print(f"\n  {neuron_display}:")
 
-        # Add nodes and classify them
-        for name in sorted(all_node_names):
-            G.add_node(name)
-            if name in self.input_names:
-                node_colors.append("skyblue")  # Input
-            elif name in self.neurons and all(
-                name != src for n in self.neurons.values() for src, _, _ in n.inputs
-            ):
-                node_colors.append("lightcoral")  # No one receives from it = output
+            if not neuron.inputs:
+                print("    [No incoming connections]")
             else:
-                node_colors.append("lightgrey")  # Middle neuron
+                for src, weight, syn_type in neuron.inputs:
+                    # Get source bias if it's a neuron
+                    if src in self.neurons:
+                        src_bias = self.neurons[src].bias
+                        src_display = f"{src} (bias: {src_bias:.2f})"
+                    else:
+                        src_display = src
 
-            val = activations[name] if activations and name in activations else None
-            labels[name] = f"{name}\n{val:.2f}" if val is not None else name
+                    print(f"    {src_display} → {weight:.2f} → {neuron.name}")
 
-        # Add edges
-        for neuron in self.neurons.values():
-            for src, _, syn_type in neuron.inputs:
-                G.add_edge(src, neuron.name, label=syn_type)
-
-        pos = nx.spring_layout(G, seed=42)
-        plt.figure(figsize=(12, 9))
-        nx.draw(G, pos, with_labels=False, node_color=node_colors, edge_color='gray', node_size=50)
-        nx.draw_networkx_labels(G, pos, labels, font_size=7)
-        nx.draw_networkx_edge_labels(G, pos, edge_labels=nx.get_edge_attributes(G, 'label'), font_size=6)
-        plt.title("Neural Graph")
-        plt.axis('off')
-        plt.tight_layout()
-        matplotlib.use("QtAgg")
-        plt.show()
+        print("\n" + "="*80 + "\n")
 
 
 
@@ -551,13 +444,14 @@ def load_xls_network(filename, input_names=None):
 
 
 def main():
-    print("Free-form Neural Network Shell (with CSV Loader and Hebbian Learning)")
+    print("Free-form Neural Network Shell")
+    print("Supported neuron types: integrate_and_fire, leaky_integrate_and_fire")
     nn = None
 
     while True:
         cmd = input("\nCommands:\n"
                     " create [inputs...]\n"
-                    " add_neuron [name] [type]\n"
+                    " add_neuron [name] [type: integrate_and_fire|leaky_integrate_and_fire]\n"
                     " set_bias [neuron] [bias]\n"
                     " add_conn [target] [source] [weight (opt)] [type (S, Sp, R, Rp, EJ, NMJ)]\n"
                     " run_step [steps] [min] [max]\n"
@@ -567,7 +461,7 @@ def main():
                     " load [filename]\n"
                     " load_csv [csv_file] [optional: input ids...]\n"
                     " load_xls [filename] [optional input1 input2 ...]\n"
-                    " run_viz\n"
+                    " visualize\n"
                     " add_input [input_name]\n"
                     " pulse_input [input_name] [voltage] [steps_on] [steps_off]\n"
                     " quit\n> ")
@@ -585,7 +479,7 @@ def main():
             elif action == "add_neuron":
                 if nn is None: print("Create network first"); continue
                 name = parts[1]
-                ntype = parts[2] if len(parts) > 2 else "sigmoid"
+                ntype = parts[2] if len(parts) > 2 else "leaky_integrate_and_fire"
                 nn.add_neuron(name, ntype)
                 print(f"Added neuron '{name}' of type '{ntype}'")
             elif action == "set_bias":
@@ -659,12 +553,6 @@ def main():
                     continue
                 print("Visualizing current network...")
                 nn.visualize()
-
-            elif action == "run_vis":
-                if nn is None: continue
-                inputs = list(map(float, parts[1:]))
-                activations = nn.forward(inputs)
-                nn.visualize(activations)
             elif action == "add_input":
                 if nn is None:
                     print("Create network first")
