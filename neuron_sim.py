@@ -41,6 +41,10 @@ class Neuron:
         self.coincidence_require = 2
         self.coincidence_window = 3  # steps
 
+        # Firing delay mechanism (for integrate_and_fire neuron)
+        self.fire_delay = 0  # number of steps to delay before firing
+        self.fire_countdown = -1  # countdown state: -1 = not pending, >=0 = steps remaining
+
     def to_dict(self):
         return {
             "name": self.name,
@@ -64,6 +68,8 @@ class Neuron:
             "stp_depression": self.stp_depression,
             "coincidence_require": self.coincidence_require,
             "coincidence_window": self.coincidence_window,
+            # firing delay parameters
+            "fire_delay": self.fire_delay,
         }
 
     @staticmethod
@@ -117,6 +123,10 @@ class Neuron:
 
         if "coincidence_window" in d:
             n.coincidence_window = d["coincidence_window"]
+
+        # Firing delay parameters
+        if "fire_delay" in d:
+            n.fire_delay = d["fire_delay"]
 
         # This ensures that if the JSON contains "burst_length": 1, it will override the default of 3.
         return n
@@ -184,12 +194,33 @@ class Neuron:
                 return 0.0
 
         elif self.neuron_type == "integrate_and_fire":
+            # Check if we're in countdown mode
+            if self.fire_countdown >= 0:
+                self.fire_countdown -= 1
+                if self.fire_countdown == 0:
+                    # Fire after delay
+                    self.fire_countdown = -1
+                    self.state = 0.0
+                    if step_index is not None:
+                        self.recent_spikes.append(step_index)
+                    return 1.0
+                else:
+                    # Still counting down, don't fire yet
+                    return 0.0
+
+            # Normal integration
             self.state += x + self.bias
             if self.state >= self.threshold:
-                self.state = 0.0
-                if step_index is not None:
-                    self.recent_spikes.append(step_index)
-                return 1.0
+                if self.fire_delay > 0:
+                    # Start countdown instead of firing immediately
+                    self.fire_countdown = self.fire_delay
+                    return 0.0
+                else:
+                    # Fire immediately (backward compatible behavior)
+                    self.state = 0.0
+                    if step_index is not None:
+                        self.recent_spikes.append(step_index)
+                    return 1.0
             else:
                 return 0.0
         elif self.neuron_type == "leaky_integrate_and_fire":
