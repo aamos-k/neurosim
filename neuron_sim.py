@@ -561,10 +561,11 @@ def load_xls_network(filename, input_names=None):
     return nn
 
 
-def calculate_adaptive_delay(nn, base_delay=0.1, min_delay=0.01, max_delay=0.5):
+def calculate_adaptive_delay(nn, base_delay=0.1, min_delay=0.005, max_delay=1.0):
     """Calculate delay based on maximum spike proximity across all neurons.
-    When neurons are close to spiking, delay is shorter (faster updates).
-    When far from spiking, delay is longer (slower updates)."""
+    When neurons are close to spiking, delay is very short (fast updates).
+    When far from spiking, delay is much longer (slow updates).
+    Uses aggressive exponential scaling to concentrate updates near spikes."""
     if nn is None or not nn.neurons:
         return base_delay
 
@@ -574,8 +575,10 @@ def calculate_adaptive_delay(nn, base_delay=0.1, min_delay=0.01, max_delay=0.5):
         max_proximity = max(max_proximity, proximity)
 
     # Inverse relationship: high proximity -> low delay (fast updates)
-    # Use exponential scaling for more dramatic effect near spikes
-    delay = max_delay - (max_delay - min_delay) * (max_proximity ** 2)
+    # Use aggressive exponential scaling (power of 4) for dramatic effect near spikes
+    # This makes the system spend most time waiting when far from spikes,
+    # then rapidly update when approaching threshold
+    delay = max_delay - (max_delay - min_delay) * (max_proximity ** 4)
     return delay
 
 def main():
