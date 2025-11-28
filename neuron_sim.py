@@ -561,25 +561,26 @@ def load_xls_network(filename, input_names=None):
     return nn
 
 
-def calculate_adaptive_delay(nn, base_delay=0.1, min_delay=0.005, max_delay=1.0):
-    """Calculate delay based on maximum spike proximity across all neurons.
-    When neurons are close to spiking, delay is very short (fast updates).
-    When far from spiking, delay is much longer (slow updates).
-    Uses aggressive exponential scaling to concentrate updates near spikes."""
+def calculate_adaptive_steps(nn, min_skip=1, max_skip=20):
+    """Calculate how many steps to skip between outputs based on spike proximity.
+    When neurons are close to spiking, skip fewer steps (more frequent output).
+    When far from spiking, skip more steps (less frequent output).
+    Uses aggressive exponential scaling to concentrate outputs near spikes."""
     if nn is None or not nn.neurons:
-        return base_delay
+        return max_skip
 
     max_proximity = 0.0
     for neuron in nn.neurons.values():
         proximity = neuron.get_spike_proximity()
         max_proximity = max(max_proximity, proximity)
 
-    # Inverse relationship: high proximity -> low delay (fast updates)
+    # Inverse relationship: high proximity -> low skip count (frequent output)
     # Use aggressive exponential scaling (power of 4) for dramatic effect near spikes
-    # This makes the system spend most time waiting when far from spikes,
-    # then rapidly update when approaching threshold
-    delay = max_delay - (max_delay - min_delay) * (max_proximity ** 4)
-    return delay
+    # This makes the system output rarely when far from spikes,
+    # then output very frequently when approaching threshold
+    skip_range = max_skip - min_skip
+    steps_to_skip = max_skip - skip_range * (max_proximity ** 4)
+    return max(min_skip, int(steps_to_skip))
 
 def main():
     print("Free-form Neural Network Shell")
@@ -633,17 +634,19 @@ def main():
                 print(f"Connection: {source} → {neuron}, weight={weight if weight else '(auto)'}, type={syn_type}")
             elif action == "run_step":
                 if nn is None: print("Create network first"); continue
-                steps = int(parts[1]) if len(parts) > 1 else 20
+                total_steps = int(parts[1]) if len(parts) > 1 else 1000
                 vmin = float(parts[2]) if len(parts) > 2 else 0.0
                 vmax = float(parts[3]) if len(parts) > 3 else 1.0
 
                 inputs = [0.0 for _ in nn.input_names]
                 history = []
 
-                print("Adaptive timing enabled: updates faster near spikes")
+                print("Adaptive output: displays more frequently near spikes")
                 print("-" * 80)
 
-                for t in range(steps):
+                sim_step = 0
+                output_count = 0
+                while sim_step < total_steps:
                     # Random walk input
                     for i in range(len(inputs)):
                         change = np.random.uniform(-0.1, 0.1)
@@ -652,42 +655,68 @@ def main():
                     output = nn.forward(inputs)
                     history.append((list(inputs), dict(output)))
 
-                    # Calculate adaptive delay
-                    delay = calculate_adaptive_delay(nn)
+                    # Calculate how many steps to skip before next output
+                    skip_steps = calculate_adaptive_steps(nn)
                     max_prox = max([n.get_spike_proximity() for n in nn.neurons.values()] or [0.0])
 
-                    print(f"Step {t:03d} | Input: {['%.2f' % x for x in inputs]} | Output: " +
+                    print(f"Step {sim_step:04d} | Input: {['%.2f' % x for x in inputs]} | Output: " +
                           ', '.join(f"{k}:{v:.2f}" for k, v in output.items()) +
-                          f" | Proximity: {max_prox:.2f} | Delay: {delay:.3f}s")
+                          f" | Proximity: {max_prox:.2f} | Skip: {skip_steps}")
 
-                    time.sleep(delay)
+                    # Advance simulation by skip_steps (run hidden steps)
+                    for _ in range(skip_steps - 1):
+                        for i in range(len(inputs)):
+                            change = np.random.uniform(-0.1, 0.1)
+                            inputs[i] = max(vmin, min(vmax, inputs[i] + change))
+                        nn.forward(inputs)
+                        sim_step += 1
+                        if sim_step >= total_steps:
+                            break
+
+                    sim_step += 1
+                    output_count += 1
+                    time.sleep(0.01)  # Minimal delay for readability
 
                 print("-" * 80)
+                print(f"Total simulation steps: {sim_step}, Outputs shown: {output_count}")
 
             elif action == "run_pulse":
                 if nn is None: print("Create network first"); continue
-                steps = int(parts[1]) if len(parts) > 1 else 20
+                total_steps = int(parts[1]) if len(parts) > 1 else 1000
                 history = []
 
-                print("Adaptive timing enabled: updates faster near spikes")
+                print("Adaptive output: displays more frequently near spikes")
                 print("-" * 80)
 
-                for t in range(steps):
+                sim_step = 0
+                output_count = 0
+                while sim_step < total_steps:
                     inputs = [np.random.choice([0.0, 1.0]) for _ in nn.input_names]
                     output = nn.forward(inputs)
                     history.append((list(inputs), dict(output)))
 
-                    # Calculate adaptive delay
-                    delay = calculate_adaptive_delay(nn)
+                    # Calculate how many steps to skip before next output
+                    skip_steps = calculate_adaptive_steps(nn)
                     max_prox = max([n.get_spike_proximity() for n in nn.neurons.values()] or [0.0])
 
-                    print(f"Step {t:03d} | Input: {inputs} | Output: " +
+                    print(f"Step {sim_step:04d} | Input: {inputs} | Output: " +
                           ', '.join(f"{k}:{v:.2f}" for k, v in output.items()) +
-                          f" | Proximity: {max_prox:.2f} | Delay: {delay:.3f}s")
+                          f" | Proximity: {max_prox:.2f} | Skip: {skip_steps}")
 
-                    time.sleep(delay)
+                    # Advance simulation by skip_steps (run hidden steps)
+                    for _ in range(skip_steps - 1):
+                        inputs = [np.random.choice([0.0, 1.0]) for _ in nn.input_names]
+                        nn.forward(inputs)
+                        sim_step += 1
+                        if sim_step >= total_steps:
+                            break
+
+                    sim_step += 1
+                    output_count += 1
+                    time.sleep(0.01)  # Minimal delay for readability
 
                 print("-" * 80)
+                print(f"Total simulation steps: {sim_step}, Outputs shown: {output_count}")
             
             elif action == "train":
                 if nn is None: print("Create network first"); continue
@@ -757,45 +786,64 @@ def main():
                 inputs = [0.0 for _ in nn.input_names]
                 
                 print(f"\nPulsing input '{input_name}' with {voltage}V for {steps_on} steps ON, {steps_off} steps OFF")
-                print("Adaptive timing enabled: updates faster near spikes")
+                print("Adaptive output: displays more frequently near spikes")
                 print("-" * 80)
 
                 # Simulate with voltage ON
-                for step in range(steps_on):
+                sim_step = 0
+                output_count = 0
+                while sim_step < steps_on:
                     inputs[input_idx] = voltage
                     output = nn.forward(inputs)
 
-                    # Calculate adaptive delay
-                    delay = calculate_adaptive_delay(nn)
-
-                    # Show spike proximity for monitoring
+                    # Calculate how many steps to skip before next output
+                    skip_steps = calculate_adaptive_steps(nn)
                     max_prox = max([n.get_spike_proximity() for n in nn.neurons.values()] or [0.0])
 
-                    print(f"Step {step:03d} (ON)  | Input: {['%.2f' % x for x in inputs]} | Output: " +
+                    print(f"Step {sim_step:04d} (ON)  | Input: {['%.2f' % x for x in inputs]} | Output: " +
                           ', '.join(f"{k}:{v:.2f}" for k, v in output.items()) +
-                          f" | Proximity: {max_prox:.2f} | Delay: {delay:.3f}s")
+                          f" | Proximity: {max_prox:.2f} | Skip: {skip_steps}")
 
-                    time.sleep(delay)
+                    # Advance simulation by skip_steps (run hidden steps)
+                    for _ in range(skip_steps - 1):
+                        inputs[input_idx] = voltage
+                        nn.forward(inputs)
+                        sim_step += 1
+                        if sim_step >= steps_on:
+                            break
+
+                    sim_step += 1
+                    output_count += 1
+                    time.sleep(0.01)  # Minimal delay for readability
 
                 # Simulate with voltage OFF
-                for step in range(steps_off):
+                sim_step = 0
+                while sim_step < steps_off:
                     inputs[input_idx] = 0.0
                     output = nn.forward(inputs)
 
-                    # Calculate adaptive delay
-                    delay = calculate_adaptive_delay(nn)
-
-                    # Show spike proximity for monitoring
+                    # Calculate how many steps to skip before next output
+                    skip_steps = calculate_adaptive_steps(nn)
                     max_prox = max([n.get_spike_proximity() for n in nn.neurons.values()] or [0.0])
 
-                    print(f"Step {step:03d} (OFF) | Input: {['%.2f' % x for x in inputs]} | Output: " +
+                    print(f"Step {sim_step:04d} (OFF) | Input: {['%.2f' % x for x in inputs]} | Output: " +
                           ', '.join(f"{k}:{v:.2f}" for k, v in output.items()) +
-                          f" | Proximity: {max_prox:.2f} | Delay: {delay:.3f}s")
+                          f" | Proximity: {max_prox:.2f} | Skip: {skip_steps}")
 
-                    time.sleep(delay)
+                    # Advance simulation by skip_steps (run hidden steps)
+                    for _ in range(skip_steps - 1):
+                        inputs[input_idx] = 0.0
+                        nn.forward(inputs)
+                        sim_step += 1
+                        if sim_step >= steps_off:
+                            break
+
+                    sim_step += 1
+                    output_count += 1
+                    time.sleep(0.01)  # Minimal delay for readability
 
                 print("-" * 80)
-                print(f"Pulse sequence complete.\n")
+                print(f"Pulse sequence complete. Total outputs shown: {output_count}\n")
             elif action == "generate":
                 if nn is None:
                     print("Create network first (use 'create [inputs...]').")
